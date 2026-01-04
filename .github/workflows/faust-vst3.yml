@@ -1,0 +1,575 @@
+name: Build FAUST VST3
+
+# Dynamic run name for easy identification in GitHub Actions UI
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch' && format('[FAUST] {0}',
+    inputs.plugin_name || 'Plugin'
+  ) || format('Build {0}', github.ref_name) }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_id:
+        description: 'Build ID (UUID for tracking)'
+        required: true
+        type: string
+      plugin_name:
+        description: 'Plugin name for display'
+        required: true
+        type: string
+        default: 'FAUST Plugin'
+      dsp_code:
+        description: 'FAUST DSP code (base64 encoded)'
+        required: true
+        type: string
+      manufacturer:
+        description: 'Plugin manufacturer name'
+        required: false
+        type: string
+        default: 'vAIst'
+      platforms:
+        description: 'Target platforms to build'
+        required: false
+        type: choice
+        options:
+          - both
+          - macos
+          - windows
+        default: 'both'
+
+# Cancel in-progress builds when new commits arrive
+concurrency:
+  group: faust-${{ github.event.inputs.build_id || github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUILD_TYPE: Release
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ============================================================================
+  # Determine which platforms to build based on input
+  # ============================================================================
+  setup-matrix:
+    name: Setup Build Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Determine Platforms
+        id: set-matrix
+        run: |
+          PLATFORMS='${{ inputs.platforms }}'
+          echo "Selected platforms: $PLATFORMS"
+
+          # Build matrix JSON based on selected platforms
+          if [ "$PLATFORMS" == "both" ] || [ -z "$PLATFORMS" ]; then
+            echo 'matrix={"include":[{"name":"macOS","os":"macos-14","artifact_name":"faust-vst3-macos","faust_arch":"darwin-arm64","cmake_generator":"Ninja","extra_flags":"-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"},{"name":"Windows","os":"windows-latest","artifact_name":"faust-vst3-windows","faust_arch":"win64","cmake_generator":"Visual Studio 17 2022","extra_flags":""}]}' >> $GITHUB_OUTPUT
+          elif [ "$PLATFORMS" == "macos" ]; then
+            echo 'matrix={"include":[{"name":"macOS","os":"macos-14","artifact_name":"faust-vst3-macos","faust_arch":"darwin-arm64","cmake_generator":"Ninja","extra_flags":"-DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"}]}' >> $GITHUB_OUTPUT
+          elif [ "$PLATFORMS" == "windows" ]; then
+            echo 'matrix={"include":[{"name":"Windows","os":"windows-latest","artifact_name":"faust-vst3-windows","faust_arch":"win64","cmake_generator":"Visual Studio 17 2022","extra_flags":""}]}' >> $GITHUB_OUTPUT
+          fi
+
+          echo "Matrix output:"
+          cat $GITHUB_OUTPUT
+
+  # ============================================================================
+  # Build FAUST DSP → VST3 for selected platforms
+  # ============================================================================
+  build:
+    name: Build ${{ matrix.name }}
+    needs: setup-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ========================================================================
+      # Install FAUST Compiler
+      # ========================================================================
+      - name: Install FAUST (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "=== Installing FAUST compiler ==="
+          brew install faust
+          faust --version
+          echo "FAUST_PATH=$(brew --prefix faust)" >> $GITHUB_ENV
+
+      - name: Install FAUST (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Write-Host "=== Installing FAUST compiler ==="
+          # Download FAUST for Windows
+          $faustUrl = "https://github.com/grame-cncm/faust/releases/download/2.77.3/Faust-2.77.3-win64.exe"
+          $installerPath = "$env:TEMP\faust-installer.exe"
+          Invoke-WebRequest -Uri $faustUrl -OutFile $installerPath
+
+          # Run silent install
+          Start-Process -Wait -FilePath $installerPath -ArgumentList "/S"
+
+          # Add to PATH
+          $faustPath = "C:\Program Files\Faust"
+          echo "FAUST_PATH=$faustPath" >> $env:GITHUB_ENV
+          echo "$faustPath\bin" >> $env:GITHUB_PATH
+
+          Write-Host "FAUST installed at: $faustPath"
+
+      - name: Verify FAUST Installation
+        run: |
+          faust --version || echo "FAUST not in PATH, checking env..."
+          echo "FAUST_PATH: $FAUST_PATH"
+
+      # ========================================================================
+      # Decode and Save DSP Code
+      # ========================================================================
+      - name: Decode DSP Code
+        id: dsp
+        run: |
+          echo "=== Decoding FAUST DSP code ==="
+          mkdir -p faust-project
+
+          # Decode base64 DSP code
+          echo "${{ inputs.dsp_code }}" | base64 -d > faust-project/plugin.dsp
+
+          # Sanitize plugin name for file system
+          SAFE_NAME=$(echo "${{ inputs.plugin_name }}" | tr -cd '[:alnum:]_-' | head -c 50)
+          if [ -z "$SAFE_NAME" ]; then
+            SAFE_NAME="FAUSTPlugin"
+          fi
+          echo "safe_name=$SAFE_NAME" >> $GITHUB_OUTPUT
+
+          # Show DSP content (first 50 lines)
+          echo "=== DSP Code Preview ==="
+          head -50 faust-project/plugin.dsp
+          echo "..."
+
+      # ========================================================================
+      # Generate JUCE Project from FAUST DSP
+      # ========================================================================
+      - name: Generate JUCE Project (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "=== Generating JUCE project with faust2juce ==="
+          cd faust-project
+
+          # Generate JUCE project
+          # -nvoices 0: Mono effect (no polyphony)
+          # Note: -effect auto requires explicit 'effect' declaration in DSP
+          # For simple DSP with just 'process', omit -effect flag
+          faust2juce -nvoices 0 plugin.dsp
+
+          # List generated files
+          echo "=== Generated Files ==="
+          ls -la
+          echo "=== All generated source files ==="
+          find . -name "*.cpp" -o -name "*.h" | head -50
+          find . -name "*.jucer" || echo "No .jucer file found"
+          find . -name "CMakeLists.txt" || echo "No CMakeLists.txt found"
+
+      - name: Generate JUCE Project (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          echo "=== Generating JUCE project with faust2juce ==="
+          cd faust-project
+
+          # faust2juce uses shasum which doesn't exist on Windows
+          # Create a wrapper that uses sha256sum instead
+          mkdir -p /tmp/faust-shim
+          cat > /tmp/faust-shim/shasum << 'SHIM'
+          #!/bin/bash
+          sha256sum "$@"
+          SHIM
+          chmod +x /tmp/faust-shim/shasum
+          export PATH="/tmp/faust-shim:$PATH"
+
+          # faust2juce is a bash script, must run in bash not PowerShell
+          echo "Checking faust2juce location..."
+          which faust2juce || echo "faust2juce not in PATH, checking FAUST_PATH..."
+
+          # Try running faust2juce
+          "$FAUST_PATH/bin/faust2juce" -nvoices 0 plugin.dsp || faust2juce -nvoices 0 plugin.dsp
+
+          echo "=== Generated Files ==="
+          ls -la
+          echo "=== Source files ==="
+          find . -name "*.cpp" -o -name "*.h" | head -50
+
+      # Create JuceHeader.h for faust2juce generated code
+      # faust2juce generates code expecting Projucer setup, but we use CMake
+      # It uses BOTH "JuceLibraryCode/JuceHeader.h" AND "../JuceLibraryCode/JuceHeader.h"
+      - name: Create JuceHeader.h
+        run: |
+          echo "=== Creating JuceLibraryCode/JuceHeader.h for CMake compatibility ==="
+
+          # Create the header content
+          HEADER_CONTENT='// JuceHeader.h - Compatibility header for faust2juce with JUCE CMake
+          // This file bridges faust2juce'\''s Projucer-style includes with CMake JUCE
+
+          #pragma once
+
+          #include <juce_core/juce_core.h>
+          #include <juce_data_structures/juce_data_structures.h>
+          #include <juce_events/juce_events.h>
+          #include <juce_graphics/juce_graphics.h>
+          #include <juce_gui_basics/juce_gui_basics.h>
+          #include <juce_gui_extra/juce_gui_extra.h>
+          #include <juce_audio_basics/juce_audio_basics.h>
+          #include <juce_audio_devices/juce_audio_devices.h>
+          #include <juce_audio_formats/juce_audio_formats.h>
+          #include <juce_audio_processors/juce_audio_processors.h>
+          #include <juce_audio_utils/juce_audio_utils.h>
+
+          // Namespace alias for convenience
+          using namespace juce;
+          '
+
+          # Create at plugin/ level for "JuceLibraryCode/JuceHeader.h"
+          mkdir -p faust-project/plugin/JuceLibraryCode
+          echo "$HEADER_CONTENT" > faust-project/plugin/JuceLibraryCode/JuceHeader.h
+
+          # Create at faust-project/ level for "../JuceLibraryCode/JuceHeader.h"
+          mkdir -p faust-project/JuceLibraryCode
+          echo "$HEADER_CONTENT" > faust-project/JuceLibraryCode/JuceHeader.h
+
+          echo "Created JuceHeader.h at both levels:"
+          ls -la faust-project/plugin/JuceLibraryCode/
+          ls -la faust-project/JuceLibraryCode/
+
+      # ========================================================================
+      # Build with CMake + JUCE
+      # ========================================================================
+      - name: Setup CMake
+        uses: lukka/get-cmake@latest
+
+      - name: Use latest Xcode (macOS)
+        if: runner.os == 'macOS'
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install macOS Dependencies
+        if: runner.os == 'macOS'
+        run: brew install ninja osxutils
+
+      - name: Create CMakeLists.txt
+        run: |
+          echo "=== Creating CMakeLists.txt for FAUST-generated JUCE project ==="
+          cat > faust-project/CMakeLists.txt << 'EOF'
+          cmake_minimum_required(VERSION 3.24)
+
+          project(${{ steps.dsp.outputs.safe_name }} VERSION 1.0.0)
+
+          # C++ Standard
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          # Disable JUCE extras and examples (CRITICAL - must be before FetchContent)
+          set(JUCE_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+          set(JUCE_BUILD_EXTRAS OFF CACHE BOOL "" FORCE)
+
+          # Fetch JUCE
+          include(FetchContent)
+          FetchContent_Declare(juce
+            GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+            GIT_TAG 8.0.4
+            GIT_SHALLOW TRUE
+          )
+          FetchContent_MakeAvailable(juce)
+
+          # Find all generated source files from faust2juce
+          # These are in the 'plugin' subdirectory (not in build directories)
+          file(GLOB FAUST_SOURCES
+            "${CMAKE_CURRENT_SOURCE_DIR}/plugin/*.cpp"
+            "${CMAKE_CURRENT_SOURCE_DIR}/plugin/*.h"
+          )
+
+          # Debug: Print found sources
+          message(STATUS "Found FAUST sources: ${FAUST_SOURCES}")
+
+          # Create VST3 plugin
+          juce_add_plugin(${{ steps.dsp.outputs.safe_name }}
+            COMPANY_NAME "${{ inputs.manufacturer }}"
+            PLUGIN_MANUFACTURER_CODE Vais
+            PLUGIN_CODE VAI1
+            FORMATS VST3
+            PRODUCT_NAME "${{ inputs.plugin_name }}"
+            COPY_PLUGIN_AFTER_BUILD FALSE
+          )
+
+          target_sources(${{ steps.dsp.outputs.safe_name }} PRIVATE ${FAUST_SOURCES})
+
+          # Include paths for faust2juce compatibility
+          # faust2juce uses both "JuceLibraryCode/JuceHeader.h" and "../JuceLibraryCode/JuceHeader.h"
+          target_include_directories(${{ steps.dsp.outputs.safe_name }} PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/plugin"
+            "${CMAKE_CURRENT_SOURCE_DIR}"
+          )
+
+          target_compile_definitions(${{ steps.dsp.outputs.safe_name }} PUBLIC
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0
+            JUCE_VST3_CAN_REPLACE_VST2=0
+          )
+
+          target_link_libraries(${{ steps.dsp.outputs.safe_name }}
+            PRIVATE
+              juce::juce_audio_utils
+              juce::juce_audio_processors
+            PUBLIC
+              juce::juce_recommended_config_flags
+              juce::juce_recommended_lto_flags
+              juce::juce_recommended_warning_flags
+          )
+          EOF
+
+          echo "CMakeLists.txt created"
+
+      - name: Configure CMake
+        run: |
+          cd faust-project
+          cmake -B build -G "${{ matrix.cmake_generator }}" \
+            -DCMAKE_BUILD_TYPE=${{ env.BUILD_TYPE }} \
+            ${{ matrix.extra_flags }}
+
+      - name: Build
+        run: |
+          cd faust-project
+          cmake --build build --config ${{ env.BUILD_TYPE }} --parallel
+
+      # ========================================================================
+      # Find and Package VST3
+      # ========================================================================
+      - name: Find VST3 Artifact
+        id: find_vst3
+        run: |
+          cd faust-project
+          VST3_PATH=$(find build -name "*.vst3" -type d | head -1)
+          if [ -z "$VST3_PATH" ]; then
+            echo "ERROR: No VST3 found!"
+            find build -type f -name "*.dll" -o -name "*.dylib" -o -name "*.so" 2>/dev/null
+            exit 1
+          fi
+          VST3_NAME=$(basename "$VST3_PATH")
+          echo "vst3_path=$VST3_PATH" >> $GITHUB_OUTPUT
+          echo "vst3_name=$VST3_NAME" >> $GITHUB_OUTPUT
+          echo "Found VST3 at: $VST3_PATH"
+
+      # ========================================================================
+      # macOS: Code sign the VST3 bundle
+      # ========================================================================
+      - name: Code Sign VST3 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          echo "=== Ad-hoc signing VST3 bundle ==="
+          cd faust-project
+          VST3_PATH="${{ steps.find_vst3.outputs.vst3_path }}"
+
+          codesign --force -s - -v "$VST3_PATH" --deep --strict --options=runtime --timestamp
+          echo "Signed bundle: $VST3_PATH"
+
+          # Verify
+          codesign -dv --verbose=4 "$VST3_PATH" 2>&1 || true
+
+          # Show architectures
+          echo "=== Plugin architectures ==="
+          file "$VST3_PATH/Contents/MacOS/"* 2>/dev/null || echo "Binary not found"
+
+      - name: Stage VST3 Bundle
+        run: |
+          cd faust-project
+          mkdir -p artifact-staging
+          cp -R "${{ steps.find_vst3.outputs.vst3_path }}" "artifact-staging/${{ steps.find_vst3.outputs.vst3_name }}"
+          echo "Staged bundle:"
+          ls -la artifact-staging/
+
+      # ========================================================================
+      # Create ZIP for Download
+      # ========================================================================
+      - name: Create ZIP Archive (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cd faust-project/artifact-staging
+          zip -r "../${{ matrix.artifact_name }}.zip" .
+          echo "Created: ${{ matrix.artifact_name }}.zip"
+          ls -la ../
+
+      - name: Create ZIP Archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cd faust-project/artifact-staging
+          Compress-Archive -Path * -DestinationPath "../${{ matrix.artifact_name }}.zip" -Force
+          Write-Host "Created: ${{ matrix.artifact_name }}.zip"
+          Get-ChildItem ../ | Format-Table Name, Length
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: faust-project/${{ matrix.artifact_name }}.zip
+          retention-days: 7
+
+  # ============================================================================
+  # Upload to R2 and Notify Backend
+  # ============================================================================
+  finalize:
+    name: Upload to R2 & Notify
+    needs: [setup-matrix, build]
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Download macOS Artifact
+        if: needs.build.result == 'success' && (inputs.platforms == 'both' || inputs.platforms == 'macos' || inputs.platforms == '')
+        uses: actions/download-artifact@v4
+        with:
+          name: faust-vst3-macos
+          path: ./artifacts/macos/
+        continue-on-error: true
+
+      - name: Download Windows Artifact
+        if: needs.build.result == 'success' && (inputs.platforms == 'both' || inputs.platforms == 'windows' || inputs.platforms == '')
+        uses: actions/download-artifact@v4
+        with:
+          name: faust-vst3-windows
+          path: ./artifacts/windows/
+        continue-on-error: true
+
+      - name: List Artifacts
+        run: |
+          echo "=== Downloaded Artifacts ==="
+          find ./artifacts -type f 2>/dev/null || echo "No artifacts found"
+
+      - name: Upload to R2
+        if: needs.build.result == 'success'
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          BUILD_ID: ${{ inputs.build_id }}
+        run: |
+          if [ -z "$R2_ACCOUNT_ID" ] || [ -z "$R2_ACCESS_KEY_ID" ] || [ -z "$R2_SECRET_ACCESS_KEY" ]; then
+            echo "⚠️ R2 secrets not configured - skipping upload"
+            exit 0
+          fi
+
+          # Install rclone
+          curl https://rclone.org/install.sh | sudo bash
+
+          # Configure rclone for R2
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${R2_ACCESS_KEY_ID}
+          secret_access_key = ${R2_SECRET_ACCESS_KEY}
+          endpoint = https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+          acl = private
+          EOF
+
+          # Upload artifacts to BOTH dev and prod buckets
+          # This ensures both environments can serve the artifacts
+          echo "=== Uploading to R2 (DEV + PROD buckets) ==="
+
+          if [ -f "./artifacts/macos/faust-vst3-macos.zip" ]; then
+            rclone copy ./artifacts/macos/faust-vst3-macos.zip r2:r2-vaist-plugins-dev/faust/${BUILD_ID}/
+            echo "Uploaded to DEV: faust/${BUILD_ID}/faust-vst3-macos.zip"
+            rclone copy ./artifacts/macos/faust-vst3-macos.zip r2:r2-vaist-plugins-prod/faust/${BUILD_ID}/
+            echo "Uploaded to PROD: faust/${BUILD_ID}/faust-vst3-macos.zip"
+          fi
+
+          if [ -f "./artifacts/windows/faust-vst3-windows.zip" ]; then
+            rclone copy ./artifacts/windows/faust-vst3-windows.zip r2:r2-vaist-plugins-dev/faust/${BUILD_ID}/
+            echo "Uploaded to DEV: faust/${BUILD_ID}/faust-vst3-windows.zip"
+            rclone copy ./artifacts/windows/faust-vst3-windows.zip r2:r2-vaist-plugins-prod/faust/${BUILD_ID}/
+            echo "Uploaded to PROD: faust/${BUILD_ID}/faust-vst3-windows.zip"
+          fi
+
+          echo "=== R2 Upload Complete ==="
+
+      - name: Determine Build Result
+        id: result
+        run: |
+          if [ "${{ needs.build.result }}" == "success" ]; then
+            echo "status=success" >> $GITHUB_OUTPUT
+            echo "message=VST3 build successful" >> $GITHUB_OUTPUT
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "message=VST3 build failed" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Notify Backend
+        env:
+          BACKEND_URL: ${{ secrets.BACKEND_URL }}
+          BACKEND_WEBHOOK_SECRET: ${{ secrets.BACKEND_WEBHOOK_SECRET }}
+          BUILD_ID: ${{ inputs.build_id }}
+          STATUS: ${{ steps.result.outputs.status }}
+          PLUGIN_NAME: ${{ inputs.plugin_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ -z "$BACKEND_URL" ] || [ -z "$BACKEND_WEBHOOK_SECRET" ]; then
+            echo "⚠️ Webhook secrets not configured - skipping notification"
+            exit 0
+          fi
+
+          # Build download URLs
+          MACOS_URL=""
+          WINDOWS_URL=""
+          if [ "$STATUS" == "success" ]; then
+            MACOS_URL="faust/${BUILD_ID}/faust-vst3-macos.zip"
+            WINDOWS_URL="faust/${BUILD_ID}/faust-vst3-windows.zip"
+          fi
+
+          # Build JSON payload
+          PAYLOAD=$(cat << EOF
+          {
+            "buildId": "${BUILD_ID}",
+            "status": "${STATUS}",
+            "pluginName": "${PLUGIN_NAME}",
+            "runId": ${RUN_ID},
+            "artifacts": {
+              "macos": "${MACOS_URL}",
+              "windows": "${WINDOWS_URL}"
+            }
+          }
+          EOF
+          )
+
+          echo "=== Sending Webhook ==="
+          echo "Build ID: ${BUILD_ID}"
+          echo "Status: ${STATUS}"
+
+          # Generate HMAC-SHA256 signature
+          SIGNATURE="sha256=$(echo -n "${PAYLOAD}" | openssl dgst -sha256 -hmac "${BACKEND_WEBHOOK_SECRET}" | cut -d' ' -f2)"
+
+          # Send webhook
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${BACKEND_URL}/api/v1/build/webhook/faust-complete" \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature-256: ${SIGNATURE}" \
+            -d "${PAYLOAD}")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n 1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          echo "Response: $HTTP_CODE"
+          echo "Body: $BODY"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "✅ Backend notified successfully"
+          else
+            echo "⚠️ Backend notification failed with HTTP $HTTP_CODE"
+          fi
